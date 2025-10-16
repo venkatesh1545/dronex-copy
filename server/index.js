@@ -14,7 +14,7 @@ app.use(cors({
     "http://localhost:5173",
     "http://10.16.61.204:8080",
     "https://dronex-copy.onrender.com",
-    "https://dronex-alert-now.vercel.app",  // ✅ ADD THIS - Your production URL
+    "https://dronex-alert-now.vercel.app",
     "https://dronex-alert-now-git-main-venkats-projects-0c1df854.vercel.app",
     /^https:\/\/dronex-alert-[a-z0-9-]+\.vercel\.app$/  // All preview URLs
   ],
