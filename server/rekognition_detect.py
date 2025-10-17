@@ -30,7 +30,12 @@ app = FastAPI()
 # Add CORS Middleware — allow calls from frontend on localhost or deployed domains
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # allow your frontend origin in production!
+    allow_origins=[
+        "http://localhost:8080",  # Local development
+        "http://localhost:5173",  # Vite dev server
+        "https://disastermanagementrekognition.onrender.com",  # Production frontend (CHANGE THIS)
+        
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
