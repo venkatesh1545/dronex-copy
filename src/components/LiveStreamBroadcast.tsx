@@ -5,13 +5,28 @@ import { supabase } from '@/integrations/supabase/client';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Eye, Square, AlertTriangle, Loader2, Signal } from 'lucide-react';
+import { Eye, Square, AlertTriangle, Loader2, Signal, Shield, Video } from 'lucide-react';
+import { useToast } from '@/hooks/use-toast';
 
 interface DetectedObject {
   class: string;
   score: number;
   bbox: [number, number, number, number];
 }
+
+type RekognitionLabel = {
+  Name: string;
+  Confidence?: number;
+  Instances?: Array<{
+    BoundingBox: {
+      Width: number;
+      Height: number;
+      Left: number;
+      Top: number;
+    };
+    Confidence?: number;
+  }>;
+};
 
 interface LiveStreamBroadcastProps {
   streamId: string;
@@ -21,6 +36,7 @@ interface LiveStreamBroadcastProps {
 }
 
 export const LiveStreamBroadcast = ({ streamId, isAdmin, onStop, quality }: LiveStreamBroadcastProps) => {
+  const { toast } = useToast();
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const broadcastCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -35,6 +51,19 @@ export const LiveStreamBroadcast = ({ streamId, isAdmin, onStop, quality }: Live
   const broadcastIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const frameNumberRef = useRef(0);
 
+  // Video recording state
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+
+  // AWS Rekognition detection state
+  const [rekognitionLabels, setRekognitionLabels] = useState<RekognitionLabel[]>([]);
+  const [isRekognitionDetecting, setIsRekognitionDetecting] = useState(false);
+  const rekognitionIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  const REKOGNITION_BACKEND_URL = 'https://disastermanagementrekognition.onrender.com/api/rekognition/detect';
+
   useEffect(() => {
     if (isAdmin) {
       initializeStream();
@@ -48,12 +77,14 @@ export const LiveStreamBroadcast = ({ streamId, isAdmin, onStop, quality }: Live
   useEffect(() => {
     if (model && isStreaming && isAdmin && videoRef.current) {
       startObjectDetection();
+      startRekognitionDetection();
     }
 
     return () => {
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
       }
+      stopRekognitionDetection();
     };
   }, [model, isStreaming, isAdmin]);
 
@@ -61,7 +92,10 @@ export const LiveStreamBroadcast = ({ streamId, isAdmin, onStop, quality }: Live
     try {
       await startStream();
       await loadModel();
-      setTimeout(() => startBroadcasting(), 2000); // Wait 2 seconds for video to be ready
+      setTimeout(() => {
+        startBroadcasting();
+        startRecording(); // Start recording
+      }, 2000);
     } catch (error) {
       console.error('❌ Error initializing stream:', error);
     }
@@ -91,7 +125,7 @@ export const LiveStreamBroadcast = ({ streamId, isAdmin, onStop, quality }: Live
           height: { ideal: quality === '4K' ? 1080 : (quality === 'HD' ? 720 : 480) },
           facingMode: 'user'
         },
-        audio: false
+        audio: true // Enable audio for recording
       };
 
       console.log('📹 Requesting camera access...');
@@ -112,6 +146,117 @@ export const LiveStreamBroadcast = ({ streamId, isAdmin, onStop, quality }: Live
     }
   };
 
+  // --- VIDEO RECORDING ---
+  const startRecording = () => {
+    if (!streamRef.current) return;
+
+    try {
+      console.log('🎥 Starting video recording...');
+      recordedChunksRef.current = [];
+
+      const options = {
+        mimeType: 'video/webm;codecs=vp9',
+        videoBitsPerSecond: 2500000 // 2.5 Mbps
+      };
+
+      const mediaRecorder = new MediaRecorder(streamRef.current, options);
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          recordedChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        console.log('🎬 Recording stopped, uploading...');
+        await uploadRecording();
+      };
+
+      mediaRecorder.start(1000); // Collect data every second
+      mediaRecorderRef.current = mediaRecorder;
+      setIsRecording(true);
+      console.log('✅ Recording started');
+    } catch (error) {
+      console.error('❌ Error starting recording:', error);
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      console.log('⏹️ Stopping recording...');
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+    }
+  };
+
+  const uploadRecording = async () => {
+    if (recordedChunksRef.current.length === 0) {
+      console.log('⚠️ No recorded data to upload');
+      return;
+    }
+
+    setIsUploading(true);
+
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      
+      if (!user) {
+        throw new Error('User not authenticated');
+      }
+
+      const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+      const fileName = `${streamId}-${Date.now()}.webm`;
+
+      console.log(`📤 Uploading: ${fileName} (${(blob.size / 1024 / 1024).toFixed(2)} MB)`);
+
+      const { error: uploadError } = await supabase.storage
+        .from('stream-recordings')
+        .upload(fileName, blob, {
+          contentType: 'video/webm',
+          cacheControl: '3600',
+          upsert: false
+        });
+
+      if (uploadError) throw uploadError;
+
+      const { data: { publicUrl } } = supabase.storage
+        .from('stream-recordings')
+        .getPublicUrl(fileName);
+
+      console.log('✅ Uploaded to:', publicUrl);
+
+      // Use Record type instead of any
+      const { error: updateError } = await supabase
+        .from('drone_streams')
+        .update({
+          recording_url: publicUrl,
+          is_recorded: true
+        } as Record<string, unknown>)
+        .eq('id', streamId);
+
+      if (updateError) throw updateError;
+
+      console.log('✅ Recording saved');
+
+      toast({
+        title: "Recording Saved",
+        description: "Stream has been saved successfully",
+      });
+    } catch (error) {
+      console.error('❌ Upload error:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      toast({
+        title: "Upload Failed",
+        description: errorMessage,
+        variant: "destructive"
+      });
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+
+
   const startBroadcasting = () => {
     if (!isAdmin) return;
 
@@ -120,41 +265,30 @@ export const LiveStreamBroadcast = ({ streamId, isAdmin, onStop, quality }: Live
     
     broadcastIntervalRef.current = setInterval(() => {
       broadcastFrame();
-    }, 200); // Broadcast every 200ms (5 FPS)
+    }, 200);
 
     console.log('✅ Broadcasting started');
   };
 
   const broadcastFrame = async () => {
-    if (!videoRef.current || !broadcastCanvasRef.current) {
-      console.log('⚠️ Video or canvas not ready');
-      return;
-    }
+    if (!videoRef.current || !broadcastCanvasRef.current) return;
 
     const video = videoRef.current;
     const canvas = broadcastCanvasRef.current;
 
-    if (video.readyState !== 4) {
-      console.log('⏳ Video not ready (readyState:', video.readyState, ')');
-      return;
-    }
+    if (video.readyState !== 4) return;
 
     try {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
 
       const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        console.log('❌ Could not get canvas context');
-        return;
-      }
+      if (!ctx) return;
 
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const frameData = canvas.toDataURL('image/jpeg', 0.7); // 70% quality
+      const frameData = canvas.toDataURL('image/jpeg', 0.7);
 
       frameNumberRef.current++;
-      
-      console.log(`📤 Broadcasting frame ${frameNumberRef.current}`);
       
       const { error } = await supabase
         .from('stream_frames')
@@ -164,9 +298,7 @@ export const LiveStreamBroadcast = ({ streamId, isAdmin, onStop, quality }: Live
           frame_number: frameNumberRef.current
         });
 
-      if (error) {
-        console.error('❌ Broadcast error:', error);
-      } else {
+      if (!error) {
         setBroadcastCount(prev => prev + 1);
         if (frameNumberRef.current % 10 === 0) {
           console.log(`✅ Successfully broadcasted ${frameNumberRef.current} frames`);
@@ -174,6 +306,61 @@ export const LiveStreamBroadcast = ({ streamId, isAdmin, onStop, quality }: Live
       }
     } catch (error) {
       console.error('❌ Exception in broadcastFrame:', error);
+    }
+  };
+
+  // --- AWS REKOGNITION DETECTION ---
+  const startRekognitionDetection = () => {
+    if (!isAdmin) return;
+    if (rekognitionIntervalRef.current) return;
+
+    console.log('🔍 Starting AWS Rekognition detection (every 3 seconds)...');
+    setIsRekognitionDetecting(true);
+
+    rekognitionIntervalRef.current = setInterval(() => {
+      performRekognitionDetection();
+    }, 3000);
+  };
+
+  const stopRekognitionDetection = () => {
+    if (rekognitionIntervalRef.current) {
+      clearInterval(rekognitionIntervalRef.current);
+      rekognitionIntervalRef.current = null;
+      setIsRekognitionDetecting(false);
+      setRekognitionLabels([]);
+      console.log('🛑 AWS Rekognition detection stopped');
+    }
+  };
+
+  const performRekognitionDetection = async () => {
+    if (!broadcastCanvasRef.current) return;
+
+    try {
+      const canvas = broadcastCanvasRef.current;
+      const base64Frame = canvas.toDataURL('image/jpeg', 0.7);
+
+      const res = await fetch(REKOGNITION_BACKEND_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_base64: base64Frame }),
+      });
+
+      if (!res.ok) return;
+
+      const json = await res.json();
+      const labels = json.labels || [];
+      setRekognitionLabels(labels);
+
+      const criticalDetection = labels.some(
+        (l: RekognitionLabel) =>
+          l.Name === 'Person' || l.Name === 'Human' || l.Name === 'Emergency'
+      );
+
+      if (criticalDetection) {
+        console.log('🚨 CRITICAL DETECTION: Person/Emergency detected by AWS Rekognition!');
+      }
+    } catch (error) {
+      console.error('❌ AWS Rekognition detection error:', error);
     }
   };
 
@@ -241,13 +428,22 @@ export const LiveStreamBroadcast = ({ streamId, isAdmin, onStop, quality }: Live
     if (broadcastIntervalRef.current) {
       clearInterval(broadcastIntervalRef.current);
     }
+    stopRekognitionDetection();
+    stopRecording();
     setIsStreaming(false);
     setIsBroadcasting(false);
   };
 
-  const handleStop = () => {
+  const handleStop = async () => {
+    console.log('🛑 Stopping stream and saving recording...');
+    
+    stopRecording(); // This will trigger upload
     cleanup();
-    onStop();
+    
+    // Wait a bit for upload to start
+    setTimeout(() => {
+      onStop();
+    }, 1000);
   };
 
   return (
@@ -271,16 +467,16 @@ export const LiveStreamBroadcast = ({ streamId, isAdmin, onStop, quality }: Live
               style={{ objectFit: 'cover' }}
             />
 
-            {isModelLoading && (
+            {(isModelLoading || isUploading) && (
               <div className="absolute inset-0 flex items-center justify-center bg-black/50">
                 <div className="text-white text-center">
                   <Loader2 className="h-8 w-8 animate-spin mx-auto mb-2" />
-                  <p className="text-sm">Loading AI Detection...</p>
+                  <p className="text-sm">{isUploading ? 'Saving Recording...' : 'Loading AI Detection...'}</p>
                 </div>
               </div>
             )}
 
-            <div className="absolute top-4 left-4 flex gap-2">
+            <div className="absolute top-4 left-4 flex gap-2 flex-wrap">
               <Badge className="bg-red-500 text-white">
                 <span className="animate-pulse mr-1">●</span>
                 LIVE
@@ -291,18 +487,41 @@ export const LiveStreamBroadcast = ({ streamId, isAdmin, onStop, quality }: Live
                   Broadcasting
                 </Badge>
               )}
+              {isRecording && (
+                <Badge className="bg-red-600 text-white">
+                  <Video className="h-3 w-3 mr-1 animate-pulse" />
+                  Recording
+                </Badge>
+              )}
               {model && (
                 <Badge className="bg-green-500 text-white">
                   <Eye className="h-3 w-3 mr-1" />
                   AI Active
                 </Badge>
               )}
+              {isRekognitionDetecting && (
+                <Badge className="bg-orange-500 text-white animate-pulse">
+                  <Shield className="h-3 w-3 mr-1" />
+                  AWS Detection ON
+                </Badge>
+              )}
             </div>
 
-            {detections.length > 0 && (
+            {rekognitionLabels.length > 0 && (
+              <div className="absolute top-4 right-4 space-y-1 max-h-48 overflow-y-auto">
+                {rekognitionLabels.slice(0, 5).map((label, idx) => (
+                  <Badge key={`aws-${idx}`} className="bg-orange-600 text-white block">
+                    <Shield className="h-3 w-3 mr-1" />
+                    {label.Name} {label.Confidence && `${Math.round(label.Confidence)}%`}
+                  </Badge>
+                ))}
+              </div>
+            )}
+
+            {detections.length > 0 && rekognitionLabels.length === 0 && (
               <div className="absolute top-4 right-4 space-y-1 max-h-48 overflow-y-auto">
                 {Array.from(new Set(detections.map(d => d.class))).slice(0, 5).map((cls, idx) => (
-                  <Badge key={idx} className="bg-orange-500 text-white block">
+                  <Badge key={idx} className="bg-green-500 text-white block">
                     <AlertTriangle className="h-3 w-3 mr-1" />
                     {cls} detected
                   </Badge>
@@ -311,15 +530,18 @@ export const LiveStreamBroadcast = ({ streamId, isAdmin, onStop, quality }: Live
             )}
 
             <div className="absolute bottom-4 left-4">
-              <Button onClick={handleStop} variant="destructive" size="sm">
+              <Button onClick={handleStop} variant="destructive" size="sm" disabled={isUploading}>
                 <Square className="h-4 w-4 mr-2" />
-                Stop Stream
+                {isUploading ? 'Saving...' : 'Stop Stream'}
               </Button>
             </div>
 
             <div className="absolute bottom-4 right-4 space-y-1">
               <div className="bg-black/70 text-white px-3 py-1 rounded text-sm">
-                Objects: {detections.length}
+                Local: {detections.length}
+              </div>
+              <div className="bg-orange-600/90 text-white px-3 py-1 rounded text-sm">
+                AWS: {rekognitionLabels.length}
               </div>
               <div className="bg-black/70 text-white px-3 py-1 rounded text-sm">
                 Frames: {frameNumberRef.current}

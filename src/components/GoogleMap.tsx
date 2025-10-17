@@ -486,7 +486,7 @@ export const GoogleMap = ({ fullSize = false }) => {
         const loader = new Loader({
           apiKey: data.apiKey,
           version: 'weekly',
-          libraries: ['places']
+          libraries: ['places','marker']
         });
         
         await loader.load();

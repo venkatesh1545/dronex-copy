@@ -1009,7 +1009,11 @@ export const LiveMap = ({ fullSize = false }: LiveMapProps) => {
       try {
         await new Promise(resolve => setTimeout(resolve, 500));
         
-        if (!mapRef.current) return;
+        if (!mapRef.current) {
+          console.log('❌ LiveMap: mapRef.current is null, retrying...');
+          setTimeout(() => initMap(), 1000);
+          return;
+        }
         
         const { data, error } = await supabase.functions.invoke('get-google-maps-key');
         if (error || !data?.apiKey) {
@@ -1019,7 +1023,7 @@ export const LiveMap = ({ fullSize = false }: LiveMapProps) => {
         const loader = new Loader({
           apiKey: data.apiKey,
           version: 'weekly',
-          libraries: ['places']
+          libraries: ['places', 'marker']
         });
         
         await loader.load();
