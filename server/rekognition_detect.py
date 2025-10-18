@@ -34,7 +34,9 @@ app.add_middleware(
         "http://localhost:8080",  # Local development
         "http://localhost:5173",  # Vite dev server
         "https://disastermanagementrekognition.onrender.com",  # Production frontend (CHANGE THIS)
-        
+        "https://dronex-copy.onrender.com",
+        "https://dronex-alert-now.vercel.app",  
+        "https://dronex-alert-now-git-main-venkats-projects-0c1df854.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
